@@ -1,0 +1,273 @@
+//EDIT: core loop = tested colour sketch + sequential pumps.
+// Python sends:  RUN <t1> <t2> <t3> <t4>\n   (milliseconds)
+// Arduino sends: RGB <r> <g> <b> after the pumps and one fresh measurement.
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <stdlib.h>          //EDIT: atol
+#include <string.h>          //EDIT: strtok
+
+#define RESOLUTION 65536    // Timer1 is 16 bit
+
+class TimerOne
+{
+  public:
+  
+    // properties
+    unsigned int pwmPeriod;
+    unsigned char clockSelectBits;
+
+    // methods
+    void initialize(long microseconds=1000000);
+    void start();
+    void stop();
+    void restart();
+    void pwm(char pin, int duty, long microseconds=-1);
+    void disablePwm(char pin);
+    void attachInterrupt(void (*isr)(), long microseconds=-1);
+    void detachInterrupt();
+    void setPeriod(long microseconds);
+    void setPwmDuty(char pin, int duty);
+    void (*isrCallback)();
+};
+
+extern TimerOne Timer1;
+
+
+
+TimerOne Timer1;              // preinstatiate
+
+ISR(TIMER1_OVF_vect)          // interrupt service routine that wraps a user defined function supplied by attachInterrupt
+{
+  Timer1.isrCallback();
+}
+
+void TimerOne::initialize(long microseconds)
+{
+  TCCR1A = 0;                 // clear control register A 
+  TCCR1B = _BV(WGM13);        // set mode as phase and frequency correct pwm, stop the timer
+  setPeriod(microseconds);
+}
+
+void TimerOne::setPeriod(long microseconds)
+{
+  long cycles = (F_CPU * microseconds) / 2000000;                                // the counter runs backwards after TOP, interrupt is at BOTTOM so divide microseconds by 2
+  if(cycles < RESOLUTION)              clockSelectBits = _BV(CS10);              // no prescale, full xtal
+  else if((cycles >>= 3) < RESOLUTION) clockSelectBits = _BV(CS11);              // prescale by /8
+  else if((cycles >>= 3) < RESOLUTION) clockSelectBits = _BV(CS11) | _BV(CS10);  // prescale by /64
+  else if((cycles >>= 2) < RESOLUTION) clockSelectBits = _BV(CS12);              // prescale by /256
+  else if((cycles >>= 2) < RESOLUTION) clockSelectBits = _BV(CS12) | _BV(CS10);  // prescale by /1024
+  else        cycles = RESOLUTION - 1, clockSelectBits = _BV(CS12) | _BV(CS10);  // request was out of bounds, set as maximum
+  ICR1 = pwmPeriod = cycles;                                                     // ICR1 is TOP in p & f correct pwm mode
+  TCCR1B &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12));
+  TCCR1B |= clockSelectBits;                                                     // reset clock select register
+}
+
+void TimerOne::setPwmDuty(char pin, int duty)
+{
+  unsigned long dutyCycle = pwmPeriod;
+  dutyCycle *= duty;
+  dutyCycle >>= 10;
+  if(pin == 1 || pin == 9)       OCR1A = dutyCycle;
+  else if(pin == 2 || pin == 10) OCR1B = dutyCycle;
+}
+
+void TimerOne::pwm(char pin, int duty, long microseconds)  // expects duty cycle to be 10 bit (1024)
+{
+  if(microseconds > 0) setPeriod(microseconds);
+  if(pin == 1 || pin == 9) {
+    DDRB |= _BV(PORTB1);                                   // sets data direction register for pwm output pin
+    TCCR1A |= _BV(COM1A1);                                 // activates the output pin
+  }
+  else if(pin == 2 || pin == 10) {
+    DDRB |= _BV(PORTB2);
+    TCCR1A |= _BV(COM1B1);
+  }
+  setPwmDuty(pin, duty);
+  start();
+}
+
+void TimerOne::disablePwm(char pin)
+{
+  if(pin == 1 || pin == 9)       TCCR1A &= ~_BV(COM1A1);   // clear the bit that enables pwm on PB1
+  else if(pin == 2 || pin == 10) TCCR1A &= ~_BV(COM1B1);   // clear the bit that enables pwm on PB2
+}
+
+void TimerOne::attachInterrupt(void (*isr)(), long microseconds)
+{
+  if(microseconds > 0) setPeriod(microseconds);
+  isrCallback = isr;                                       // register the user's callback with the real ISR
+  TIMSK1 = _BV(TOIE1);                                     // sets the timer overflow interrupt enable bit
+  sei();                                                   // ensures that interrupts are globally enabled
+  start();
+}
+
+void TimerOne::detachInterrupt()
+{
+  TIMSK1 &= ~_BV(TOIE1);                                   // clears the timer overflow interrupt enable bit 
+}
+
+void TimerOne::start()
+{
+  TCCR1B |= clockSelectBits;
+}
+
+void TimerOne::stop()
+{
+  TCCR1B &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12));          // clears all clock selects bits
+}
+
+void TimerOne::restart()
+{
+  TCNT1 = 0;
+}
+
+#define S0     6   // Please notice the Pin's define
+#define S1     5
+#define S2     4
+#define S3     3
+#define OUT    2 
+
+int   g_count = 0;    // count the frequecy
+int   g_array[3];     // store the RGB value
+int   g_flag = 0;     // filter of RGB queue
+float g_SF[3];        // save the RGB Scale factor
+
+//EDIT: pump pins from Group_pump.ino
+const uint8_t PUMP_PINS[4] = {7, 11, 12, 13};
+
+//EDIT: run the pumps one after another
+void runPumps(unsigned int ms[4])
+{
+  for (uint8_t i = 0; i < 4; i++) {
+    if (ms[i] == 0) continue;
+    digitalWrite(PUMP_PINS[i], HIGH);
+    delay(ms[i]);
+    digitalWrite(PUMP_PINS[i], LOW);
+  }
+}
+
+// Init TSC230 and setting Frequency.
+void TSC_Init()
+{
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+  pinMode(OUT, INPUT); 
+  digitalWrite(S0, LOW);// OUTPUT FREQUENCY SCALING 2%
+  digitalWrite(S1, HIGH); 
+}
+
+// Select the filter color
+void TSC_FilterColor(int Level01, int Level02)
+{
+  if(Level01 != 0)
+    Level01 = HIGH;
+    
+  if(Level02 != 0)
+    Level02 = HIGH;
+    
+  digitalWrite(S2, Level01); 
+  digitalWrite(S3, Level02); 
+}
+void TSC_Count()
+{
+  g_count ++ ;
+}
+void TSC_Callback()
+{
+  switch(g_flag)
+  {
+    case 0:
+      Serial.println("->WB Start");
+      TSC_WB(LOW, LOW);              //Filter without Red         
+      break;
+    case 1:
+      Serial.print("->Frequency R=");
+      Serial.println(g_count);
+      g_array[0] = g_count;
+      TSC_WB(HIGH, HIGH);            //Filter without Green        
+      break;    
+    case 2:
+      Serial.print("->Frequency G=");        
+      Serial.println(g_count);
+      g_array[1] = g_count;
+      TSC_WB(LOW, HIGH);             //Filter without Blue
+      break; 
+    case 3:
+      Serial.print("->Frequency B=");
+      Serial.println(g_count);
+      Serial.println("->WB End");
+      g_array[2] = g_count;
+      TSC_WB(HIGH, LOW);            //Clear(no filter)   
+      break;
+    default:     
+      g_count = 0;        
+      break; 
+  }
+} 
+
+ void TSC_WB(int Level0, int Level1)  //White Balance
+ {
+   g_count = 0;
+   g_flag ++;
+   TSC_FilterColor(Level0, Level1);
+   Timer1.setPeriod(1000000);
+ }
+ void setup()
+ {
+   //EDIT: pump pins off
+   for (uint8_t i = 0; i < 4; i++) {
+     pinMode(PUMP_PINS[i], OUTPUT);
+     digitalWrite(PUMP_PINS[i], LOW);
+   }
+
+   TSC_Init();
+   Serial.begin(9600);
+   Timer1.initialize();             // defaulte is 1s
+   Timer1.attachInterrupt(TSC_Callback);  
+   attachInterrupt(0, TSC_Count, RISING);   
+   delay(4000); 
+   for(int i=0; i<3; i++)
+   Serial.println(g_array[i]);
+   g_SF[0] = 255.0/ g_array[0];     //R Scale factor
+   g_SF[1] = 255.0/ g_array[1] ;    //G Scale factor
+   g_SF[2] = 255.0/ g_array[2] ;    //B Scale factor
+   Serial.println(g_SF[0]);
+   Serial.println(g_SF[1]);
+   Serial.println(g_SF[2]); 
+ }
+ void loop() // Taking the py input
+ {
+   //EDIT! wait for RUN <t1> <t2> <t3> <t4> (milliseconds)
+   if (Serial.available() == 0) return;
+
+   String cmd = Serial.readStringUntil('\n');
+   cmd.trim();
+   if (!cmd.startsWith("RUN ")) return;
+
+   char buf[64];
+   cmd.toCharArray(buf, sizeof(buf));
+
+   unsigned int ms[4] = {0, 0, 0, 0};
+   char *tok = strtok(buf, " ");          // skip "RUN"
+   for (uint8_t i = 0; i < 4; i++) {
+     tok = strtok(NULL, " ");
+     if (tok == NULL) break;
+     ms[i] = (unsigned int)atol(tok);   //EDIT milliseconds straight through
+   }
+
+   runPumps(ms);
+
+   //EDIT: start one fresh R/G/B measurement and wait for the four 1 s ticks
+   g_flag = 0;
+   delay(4500);
+
+   Serial.print(F("RGB "));
+   Serial.print(int(g_array[0] * g_SF[0]));
+   Serial.print(' ');
+   Serial.print(int(g_array[1] * g_SF[1]));
+   Serial.print(' ');
+   Serial.println(int(g_array[2] * g_SF[2]));
+ }
