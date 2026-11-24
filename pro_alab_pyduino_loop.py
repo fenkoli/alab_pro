@@ -1,4 +1,6 @@
 import serial.tools.list_ports
+import csv
+from pathlib import Path
 
 ## Forming connection with Arduino ##
 
@@ -40,7 +42,7 @@ def creating_ard_connection():
     #connection is created here
     con.baudrate = 9600
     con.timeout = 1 #  con.read results withou /n will get stuck without this
-    con.port = ports[int(com)].device  #Should on macOS and Windows
+    con.port = ports[int(com)].device  #Should work with macOS and Windows
     con.open()
 
     return con
@@ -77,11 +79,23 @@ def read_result(connection):
             result = [int(value) for value in line.split()[1:]] #Turns RGB values to int list
             return result
 
-def save_results(receipe, rgb):
-    #Here we can save results to csv or what ever
-    #I will just print them for now
-    print(receipe)
-    print(rgb)
+#def save_results(receipe, rgb):
+#    #Here we can save results to csv or what ever, I will just print them for now
+#    print(receipe)
+#    print(rgb)
+
+def save_result(pump_ms, rgb_result):
+    filepath = Path(__file__).resolve().parent / "data" / "results.csv"
+
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = filepath.exists()
+
+    with open(filepath, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["t1_ms", "t2_ms", "t3_ms", "t4_ms", "r", "g", "b"])
+        writer.writerow([*pump_ms, *rgb_result])
+
 
 def loop():
     con = creating_ard_connection()
